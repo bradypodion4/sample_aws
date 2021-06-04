@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: First Pipeline with Cloudformation
+
+Mappings:
+  Constants:
+    NAMING-PREFIX:
+      # The prefix used in all the resources
+      value: mymonitor
+    USER-GROUPS-AUTH-TABLE-NAME:
+      # Name of the DynamoDB table to correlate a user with its permissions
+      value: user_groups_authorizations
+    LOGS-DESTINATION:
+      # Name of the cloudwatch log destination
+      value: logs_destination
+
+
+
+Parameters:
+  ApplicationName:
+    Default: sample_aws_3bee
+    Description: Application Name
+    Type: String
+  ENV:
+    AllowedPattern: dev|prod|test
+    Default: dev
+    Description: Environment (dev|prod|test)
+    Type: String
+
+#  BucketPrefix:
+#    Default: webapp
+#    Description: Bucket prefix
+#    Type: String
+#  BucketSuffix:
+#    Default: static
+#    Description: Bucket suffix
+#    Type: String
+
+Globals:
+  Function:
+    Environment:
+      Variables:
+        ENV: !Ref ENV
+        DEBUG_MODE: true
+
+
+Resources:
+
+# --------------------------------------------------------------------------------------------------------------------
+# ROLES AND POLYCIES
+# --------------------------------------------------------------------------------------------------------------------
+  BaseLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      RoleName: !Sub "sample-aws-global-role"
+
+  BaseLambdaRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn:
+      - BaseLambdaRole
+      - UserPoolGroupAuthorizationDDBTables
+      - firstRestApi
+    Properties:
+      PolicyName: !Sub '${ENV}-mymonitor-base-lambda-policy'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DynamoDBActions
+            Effect: Allow
+            Action: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:Scan',
+                     'dynamodb:UpdateItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem']
+            Resource: !GetAtt UserPoolGroupAuthorizationDDBTables.Arn
+
+          - Sid: Logs
+            Effect: Allow
+            Action: ['logs:*']
+            Resource: ['*']
+
+          - Sid: ExecuteApi
+            Effect: Allow
+            Action: ['execute-api:Invoke']
+            Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${firstRestApi}/${ENV}/*
+
+          - Sid: DescribeCognitoUser
+            Effect: Allow
+            Action: ['cognito-idp:AdminGetUser']
+            Resource: !GetAtt myMonitorCognitoPool.Arn
+
+#          - Sid: AllowAssumeRole
+#            Effect: Allow
+#            Action: ['sts:AssumeRole']
+#            Resource: !Sub 'arn:aws:iam:${AWS::AccountId}:role/*'
+
+      Roles:
+        - !Ref BaseLambdaRole
+
+
+  commonRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      RoleName: !Sub 'common-role'
+
+  commonRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn:
+      - commonRole
+    Properties:
+      PolicyName: !Sub 'common-role-policy'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowLogging
+            Effect: Allow
+            Action: ['logs:*']
+            Resource: ['*']
+#            !Ref firstTriggerLambda
+
+#          - Sid: DenyDeleteLogs
+#            Effect: Deny
+#            Action: ['logs:CancelExportTask','logs:DeleteDestination','logs:DeleteLogGroup',
+#                     'logs:DeleteLogStream','logs:DeleteMetricFilter','logs:DeleteRetentionPolicy',
+#                     'logs:DeleteSubscriptionFilter']
+#            Resource: ['*']
+
+          - Sid: AllowLambdaInvoke
+            Action: ['lambda:InvokeFunction','lambda:InvokeAsync']
+            Effect: Allow
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+
+          - Sid: AllowToS3
+            Action: ['s3:Get*', 's3:List*', 's3:DeleteObject', 's3:PutObject',
+                     's3:CreateBucket', 's3:DeleteBucket', 's3:CreateBucket']
+            Effect: Allow
+            Resource: ['*']
+      Roles:
+        - !Ref commonRole
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# API GATEWAYS
+# --------------------------------------------------------------------------------------------------------------------
+
+  3beeLandsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Auth:
+        DefaultAuthorizer: LambdaTokenAuthorizer
+        Authorizers:
+          LambdaTokenAuthorizer:
+            FunctionArn: !GetAtt AuthorizerLambda.Arn
+      StageName: Dev
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title: !Sub '3beeRESTApi'
+        paths:
+
+          /v1/api/lands:
+            get:
+              produces:
+                - "application/json"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+          /v1/api/lands/create:
+            post:
+              produces:
+                - "application/json"
+              security:
+                - apiLambdaAuthorizer: []
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+          /v1/api/lands/delete/{landsName}:
+
+            delete:
+              produces:
+                - "application/json"
+              parameters:
+                - name: "bucketName"
+                  in: path
+                  required: true
+                  type: "string"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+
+          /v1/api/lands/update/{landsName}:
+            patch:
+              produces:
+                - "application/json"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+            delete:
+              produces:
+                - "application/json"
+              parameters:
+                - name: "bucketName"
+                  in: path
+                  required: true
+                  type: "string"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+
+  3beeDeviceApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Auth:
+        DefaultAuthorizer: LambdaTokenAuthorizer
+        Authorizers:
+          LambdaTokenAuthorizer:
+            FunctionArn: !GetAtt AuthorizerLambda.Arn
+      StageName: Dev
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title: !Sub '3beeRESTApi'
+        paths:
+
+          /v1/api/devices:
+            get:
+              produces:
+                - "application/json"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+          /v1/api/devices/create:
+            post:
+              produces:
+                - "application/json"
+              security:
+                - apiLambdaAuthorizer: []
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+          /v1/api/devices/delete/{deviceName}:
+
+            delete:
+              produces:
+                - "application/json"
+              parameters:
+                - name: "bucketName"
+                  in: path
+                  required: true
+                  type: "string"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+
+          /v1/api/devices/update/{deviceName}:
+            patch:
+              produces:
+                - "application/json"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+            delete:
+              produces:
+                - "application/json"
+              parameters:
+                - name: "bucketName"
+                  in: path
+                  required: true
+                  type: "string"
+              response:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LandsHandlerLambdaFunction.Arn}/invocations
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# LAMBDA
+# --------------------------------------------------------------------------------------------------------------------
+
+  AuthorizerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: ../../src/lambdas/api_auth
+      FunctionName: !Sub 'api_authorizer'
+      Handler: api_authorizer.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt BaseLambdaRole.Arn
+      Runtime: python3.8
+      Timeout: 15
+      Environment:
+        Variables:
+          TRUSTED_USER_POOL_ID: !Ref 3BeeCognitoPool
+          TRUSTED_USER_POOL_REGION: !Ref AWS::Region
+          USER_GROUPS_DDB_TABLE: !Ref UserPoolGroupAuthorizationDDBTables
+          DEBUG_MODE: true
+
+  LandsHandlerLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.7
+      CodeUri: ../../src/lambdas/lands_handler
+      FunctionName: !Sub "dynamo_crud"
+      Role: !GetAtt commonRole.Arn
+      Timeout: 5
+      MemorySize: 128
+#      Environment:
+#        Variables:
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# S3 BUCKETS
+# --------------------------------------------------------------------------------------------------------------------
+#  S3_STORING_BUCKET:
+#    Type: "AWS::S3::Bucket"
+#    Properties:
+#      BucketName: !Sub '3bee-bucket-${AWS::Region}-${AWS::AccountId}-encrypted'
+#      BucketEncryption:
+#        ServerSideEncryptionConfiguration:
+#          - ServerSideEncryptionByDefault:
+#              SSEAlgorithm: AES256
+#    DeletionPolicy: Delete
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# DYNAMO DB TABLES
+# --------------------------------------------------------------------------------------------------------------------
+# DynamoDB is schemaless (except the key schema)
+  UserPoolGroupAuthorizationDDBTables:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ENV}_ddb_users_group_auth_table'
+      AttributeDefinitions:
+        - AttributeName: user_group_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_group_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  LandsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'ddb_lands_table'
+      AttributeDefinitions:
+        - AttributeName: land
+          AttributeType: S
+      KeySchema:
+        - AttributeName: name
+          KeyType: RANGE
+
+  DeviceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'ddb_device_table'
+      AttributeDefinitions:
+        - AttributeName: device
+          AttributeType: S
+      KeySchema:
+        - AttributeName: name
+          KeyType: RANGE
+# --------------------------------------------------------------------------------------------------------------------
+# COGNITO USER POOL
+# --------------------------------------------------------------------------------------------------------------------
+  3BeeCognitoPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AliasAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+          RequireUppercase: false
+          TemporaryPasswordValidityDays: 9
+#        MfaConfiguration: true
+      UserPoolName: !Sub '3bee-dev-cognito-user-pool'
+
+  3BeeClientApp:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: '3Bee-web-app'
+      ExplicitAuthFlows:
+        - 'ADMIN_NO_SRP_AUTH'
+        - 'USER_PASSWORD_AUTH'
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+      UserPoolId: !Ref 3BeeCognitoPool
+
+
